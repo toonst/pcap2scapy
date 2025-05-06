@@ -1,215 +1,190 @@
 #!/usr/bin/env python3
-"""
-pcap2scapy.py — convert a capture (pcap / pcapng) into a lean, readable
-Scapy‑replay script, using an external *str.format* template.
-
+"""pcap2scapy_refactored.py — turn a packet capture (pcap/pcapng) into a
+stand‑alone Scapy replay script based on an external template.
 """
 from __future__ import annotations
 
 import argparse
-import pathlib
-import textwrap
+from collections.abc import Sequence
 from datetime import datetime, timezone
-from typing import List, Sequence
+from pathlib import Path
 
-from scapy.all import rdpcap, Packet, Raw  # type: ignore
-# Import field classes in a way that works across Scapy versions
-import scapy.fields as _scapy_fields
+from scapy.all import Packet, Raw, rdpcap  # type: ignore
+import scapy.fields as scapy_fields
 
-ChecksumField   = getattr(_scapy_fields, 'ChecksumField', type('DummyChecksum', (), {}))
-LenField        = getattr(_scapy_fields, 'LenField', _scapy_fields.Field)
-FieldLenField   = getattr(_scapy_fields, 'FieldLenField', _scapy_fields.Field)
-FieldListField  = getattr(_scapy_fields, 'FieldListField', _scapy_fields.Field)
-RandFieldBase    = getattr(_scapy_fields, 'RandFieldBase', type('DummyRandFieldBase', (), {}))
-RandField        = getattr(_scapy_fields, 'RandField', type('DummyRandField', (), {}))
-ConditionalField = getattr(_scapy_fields, 'ConditionalField', _scapy_fields.Field)
+ChecksumField = getattr(scapy_fields, "ChecksumField", type("ChecksumField", (), {}))
+LenField = getattr(scapy_fields, "LenField", scapy_fields.Field)
+FieldLenField = getattr(scapy_fields, "FieldLenField", scapy_fields.Field)
+FieldListField = getattr(scapy_fields, "FieldListField", scapy_fields.Field)
+RandFieldBase = getattr(scapy_fields, "RandFieldBase", type("RandFieldBase", (), {}))
+RandField = getattr(scapy_fields, "RandField", type("RandField", (), {}))
+ConditionalField = getattr(scapy_fields, "ConditionalField", scapy_fields.Field)
 
-INDENT = " " * 4  # 4‑space indent throughout
+INDENT = " " * 4
+AUTO_GENERATED_FIELDS = (ChecksumField, LenField, FieldLenField)
 
-# ---------------------------------------------------------------------------
-# Generic rule: drop anything Scapy will re‑create (checksums, lengths, etc.)
-# ---------------------------------------------------------------------------
-
-AUTO_FIELD_CLASSES = (
-    ChecksumField,
-    LenField,
-    FieldLenField,
-)
-
-# Per-protocol overrides
-ALWAYS_SKIP: dict[str, set[str]] = {
+PROTOCOL_FIELD_EXCLUSIONS: dict[str, set[str]] = {
     "Ether": {"src", "dst", "type"},
     "IP": {"ihl", "len", "chksum", "id", "proto"},
     "UDP": {"len", "chksum"},
     "TCP": {"chksum", "dataofs"},
 }
 
-_IP_AUTO_PROTO = { "UDP": 17, "TCP": 6, "ICMP": 1 }
 
-
-def _is_rand_default(fld) -> bool:
-    """True if the field's default is any Rand* instance or a callable."""
+def has_random_default(field) -> bool:
     from types import FunctionType
-    return isinstance(fld.default, (RandFieldBase, RandField)) or isinstance(fld.default, FunctionType)
 
-def _should_skip(layer: Packet, fld) -> bool:
-    """Return True if *fld* can be omitted without altering replay behaviour."""
+    return isinstance(field.default, (RandFieldBase, RandField, FunctionType))
 
-    # 0. ─── explicit user table ───────────────────────────────────────────────
-    if fld.name in ALWAYS_SKIP.get(layer.__class__.__name__, ()):
+
+def should_skip_field(layer: Packet, field) -> bool:
+    if field.name in PROTOCOL_FIELD_EXCLUSIONS.get(layer.__class__.__name__, set()):
         return True
 
-    # unwrap nested ConditionalField objects
-    while isinstance(fld, ConditionalField):
-        fld = fld.fld
+    while isinstance(field, ConditionalField):
+        field = field.fld
 
-    # 1. IP-specific heuristics ----------------------------------------------
-    if layer.__class__.__name__ == "IP":
-        if fld.name in {"src", "dst"} :
-            return False
-
-    # 2. ─── scapy will rewrite these in post_build ───────────────────────────
-    if isinstance(fld, AUTO_FIELD_CLASSES):
-        return True
-    if fld.default is None:                        # len, ihl, chksum, ...
+    if isinstance(field, AUTO_GENERATED_FIELDS):
         return True
 
-    # 3. ─── empty list-type fields (FieldListField, PacketListField, …) ──────
-    if getattr(fld, "islist", False) and not layer.getfieldval(fld.name):
+    if field.default is None:
         return True
 
-
-    # 4. ─── random / callable defaults (Rand*, lambda, etc.) ─────────────────
-    if _is_rand_default(fld):
+    if getattr(field, "islist", False) and not layer.getfieldval(field.name):
         return True
 
-    # 5. ─── value equals the protocol default ────────────────────────────────
+    if has_random_default(field):
+        return True
+
     try:
-        if hasattr(fld, "is_default"):
-            return fld.is_default(layer)
-        return layer.getfieldval(fld.name) == fld.default
+        if hasattr(field, "is_default"):
+            return field.is_default(layer)
+        return layer.getfieldval(field.name) == field.default
     except Exception:
         return False
-# ---------------------------------------------------------------------------
-# Pretty‑printing helpers
-# ---------------------------------------------------------------------------
 
-def _inline_layer(layer: Packet) -> str:
-    """One‑liner representation for nested packets (RRs, options, …)."""
-    parts = []
-    for fld in layer.fields_desc:
-        if _should_skip(layer, fld):
+
+def inline_layer(layer: Packet) -> str:
+    chunks: list[str] = []
+    for field in layer.fields_desc:
+        if should_skip_field(layer, field):
             continue
-        val = layer.getfieldval(fld.name)
-        parts.append(f"{fld.name}={repr(val)}")
-    inner = ", ".join(parts)
-    return f"{layer.__class__.__name__}({inner})" if inner else f"{layer.__class__.__name__}()"
+        value = layer.getfieldval(field.name)
+        chunks.append(f"{field.name}={repr(value)}")
+    body = ", ".join(chunks)
+    return f"{layer.__class__.__name__}({body})" if body else f"{layer.__class__.__name__}()"
 
 
-def _fmt_value(val, indent: str) -> str:
-    """Pretty‑print lists & nested packets with indentation."""
-    if isinstance(val, list):
-        if not val:
+def format_value(value, current_indent: str) -> str:
+    if isinstance(value, list):
+        if not value:
             return "[]"
-        inner_indent = indent + INDENT
+        nested_indent = current_indent + INDENT
         rendered = [
-            inner_indent + (_inline_layer(v) if isinstance(v, Packet) else repr(v))
-            for v in val
+            nested_indent + (inline_layer(v) if isinstance(v, Packet) else repr(v))
+            for v in value
         ]
-        return "[\n" + ",\n".join(rendered) + "\n" + indent + "]"
-    elif isinstance(val, Packet):
-        return _inline_layer(val)
-    else:
-        return repr(val)
+        return "[\n" + ",\n".join(rendered) + "\n" + current_indent + "]"
+    if isinstance(value, Packet):
+        return inline_layer(value)
+    return repr(value)
 
 
-def _layer_to_code(layer: Packet, base_indent: str) -> str:
-    """Multi‑line pretty constructor for *layer*."""
-    fields: List[str] = []
-    for fld in layer.fields_desc:
-        if _should_skip(layer, fld):
+def layer_to_code(layer: Packet, base_indent: str) -> str:
+    rendered: list[str] = []
+    for field in layer.fields_desc:
+        if should_skip_field(layer, field):
             continue
-        value = layer.getfieldval(fld.name)
-        fields.append(f"{fld.name}={_fmt_value(value, base_indent + INDENT)}")
+        value = layer.getfieldval(field.name)
+        rendered.append(f"{field.name}={format_value(value, base_indent + INDENT)}")
 
-    if not fields:
+    if not rendered:
         return f"{layer.__class__.__name__}()"
 
-    inner = (",\n" + base_indent + INDENT).join(fields)
+    inner = (",\n" + base_indent + INDENT).join(rendered)
     return f"{layer.__class__.__name__}(\n{base_indent + INDENT}{inner}\n{base_indent})"
 
 
-def pkt_to_code(pkt: Packet, idx: int) -> str:
-    """Return fully formatted ``pkt<idx>`` definition."""
-    layers: List[str] = []
-    current: Packet | None = pkt
+def packet_to_code(packet: Packet, index: int) -> str:
+    layers: list[str] = []
+    current: Packet | None = packet
     while current and isinstance(current, Packet) and not isinstance(current, Raw):
-        layers.append(_layer_to_code(current, INDENT))
+        layers.append(layer_to_code(current, INDENT))
         current = current.payload if isinstance(current.payload, Packet) else None
-
     body = ("/\n" + INDENT).join(layers)
-    return f"pkt{idx} = (\n{INDENT}{body}\n)"
-
-# ---------------------------------------------------------------------------
-# Template helpers
-# ---------------------------------------------------------------------------
-
-def build_packet_code(pkts: Sequence[Packet]):
-    defs, names, times = [], [], []
-    for i, p in enumerate(pkts, 1):
-        defs.append(pkt_to_code(p, i))
-        names.append(f"pkt{i}")
-        times.append(str(p.time))
-    return "\n\n".join(defs), ", ".join(names), ", ".join(times)
+    return f"pkt{index} = (\n{INDENT}{body}\n)"
 
 
-def render_template(tmpl: str, **kw) -> str:
-    return tmpl.format(**kw)
+def render_packets(packets: Sequence[Packet]) -> tuple[str, str, str]:
+    definitions: list[str] = []
+    names: list[str] = []
+    timestamps: list[str] = []
 
-# ---------------------------------------------------------------------------
-# CLI driver
-# ---------------------------------------------------------------------------
+    for index, packet in enumerate(packets, start=1):
+        definitions.append(packet_to_code(packet, index))
+        names.append(f"pkt{index}")
+        timestamps.append(str(packet.time))
+
+    return "\n\n".join(definitions), ", ".join(names), ", ".join(timestamps)
+
+
+def apply_template(template_path: Path, **kwargs) -> str:
+    return template_path.read_text(encoding="utf-8").format(**kwargs)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Convert pcap/pcapng capture to a stand‑alone Scapy replay script",
+    )
+    parser.add_argument("capture", help="Input pcap/pcapng file")
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="Output .py file (default: <capture>_replay.py)",
+    )
+    parser.add_argument(
+        "--template",
+        type=Path,
+        help="Template path (default: template.py.tmpl next to this script)",
+    )
+    return parser.parse_args()
+
 
 def main() -> None:  # pragma: no cover
-    ap = argparse.ArgumentParser(description="Convert a capture to a Scapy replay script")
-    ap.add_argument("capture", help="pcap/pcapng file to convert")
-    ap.add_argument("-o", "--output", help="output .py file (default: <stem>_replay.py)")
-    ap.add_argument("--template", help="template path (default: template.py.tmpl)")
-    args = ap.parse_args()
+    args = parse_args()
 
-    cap = pathlib.Path(args.capture).expanduser()
-    if not cap.is_file():
-        ap.error(f"capture not found: {cap}")
+    capture_path = Path(args.capture).expanduser()
+    if not capture_path.is_file():
+        raise SystemExit(f"Capture not found: {capture_path}")
 
-    pkts = rdpcap(str(cap))
-    if not pkts:
-        ap.error("capture is empty — nothing to convert")
+    packets = rdpcap(str(capture_path))
+    if not packets:
+        raise SystemExit("Capture is empty — nothing to convert")
 
-    out = pathlib.Path(args.output) if args.output else cap.with_name(cap.stem + "_replay.py")
-    tmpl = pathlib.Path(args.template) if args.template else pathlib.Path(__file__).with_name("template.py.tmpl")
-    if not tmpl.is_file():
-        ap.error(f"template not found: {tmpl}")
+    output_path = args.output or capture_path.with_name(f"{capture_path.stem}_replay.py")
 
-    defs, names, times = build_packet_code(pkts)
-    iso_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    template_path = args.template or Path(__file__).with_name("template.py.tmpl")
+    if not template_path.is_file():
+        raise SystemExit(f"Template not found: {template_path}")
 
-    replay_code = render_template(
-        tmpl.read_text(encoding="utf-8"),
-        timestamp=iso_ts,
-        packet_definitions=defs,
-        pkt_list=names,
-        time_list=times,
+    packet_defs, packet_names, packet_times = render_packets(packets)
+    timestamp_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    script_body = apply_template(
+        template_path,
+        timestamp=timestamp_iso,
+        packet_definitions=packet_defs,
+        pkt_list=packet_names,
+        time_list=packet_times,
     )
 
-    out.write_text(replay_code, encoding="utf-8")
-    out.chmod(out.stat().st_mode | 0o111)
+    output_path.write_text(script_body, encoding="utf-8")
+    output_path.chmod(output_path.stat().st_mode | 0o111)
 
     print(
-        textwrap.dedent(
-            f"""
-            Created {out}  ({len(pkts)} packets).\nRun with, e.g.:\n  sudo python {out} -i eth0
-            """
-        ).strip()
+        f"Created {output_path} ({len(packets)} packets).\n"
+        f"Run with, e.g.:\n  sudo python {output_path} -i eth0",
     )
 
 
