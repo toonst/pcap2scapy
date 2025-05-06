@@ -47,7 +47,8 @@ def should_skip_field(layer: Packet, field) -> bool:
     if isinstance(field, AUTO_GENERATED_FIELDS):
         return True
 
-    if field.default is None:
+    value = layer.getfieldval(field.name)
+    if field.default is None and value is None:
         return True
 
     if getattr(field, "islist", False) and not layer.getfieldval(field.name):
